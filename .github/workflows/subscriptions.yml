@@ -1,0 +1,41 @@
+name: Subscriptions
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # каждые 10 минут
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # чтобы коммитить subscribers.json
+
+concurrency:
+  group: subscriptions
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Poll Telegram updates
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python subscribe.py
+
+      - name: Commit subscribers if changed
+        run: |
+          if ! git diff --quiet subscribers.json 2>/dev/null || [ -n "$(git status --porcelain subscribers.json)" ]; then
+            git config user.name "wc-digest-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add subscribers.json
+            git commit -m "update subscribers"
+            git pull --rebase
+            git push
+          fi
