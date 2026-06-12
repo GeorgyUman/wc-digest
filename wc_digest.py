@@ -105,6 +105,45 @@ def fetch_todays_matches(api_key: str) -> list[dict]:
     return matches
 
 
+def fetch_yesterdays_results(api_key: str) -> list[dict]:
+    """Завершённые матчи за вчерашний «футбольный день» (вчера 06:00 — сегодня 06:00)."""
+    sport_key = find_world_cup_sport_key(api_key)
+    r = requests.get(
+        f"{ODDS_API_BASE}/sports/{sport_key}/scores/",
+        params={"apiKey": api_key, "daysFrom": 2, "dateFormat": "iso"},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+    now_lisbon = datetime.now(LISBON)
+    window_end = now_lisbon.replace(hour=6, minute=0, second=0, microsecond=0)
+    if now_lisbon < window_end:
+        window_end -= timedelta(days=1)
+    window_start = window_end - timedelta(days=1)
+
+    results = []
+    for ev in r.json():
+        if not ev.get("completed") or not ev.get("scores"):
+            continue
+        kickoff_utc = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
+        kickoff = kickoff_utc.astimezone(LISBON)
+        if not (window_start <= kickoff < window_end):
+            continue
+        score_by_team = {s["name"]: s["score"] for s in ev["scores"]}
+        results.append(
+            {
+                "home": ev["home_team"],
+                "away": ev["away_team"],
+                "home_score": score_by_team.get(ev["home_team"], "?"),
+                "away_score": score_by_team.get(ev["away_team"], "?"),
+                "kickoff": kickoff,
+            }
+        )
+
+    results.sort(key=lambda m: m["kickoff"])
+    return results
+
+
 def extract_odds(event: dict) -> dict | None:
     bookmakers = event.get("bookmakers", [])
     if not bookmakers:
@@ -205,11 +244,19 @@ def ask_claude(api_key: str, matches: list[dict]) -> list[dict]:
 
 # ---------------------------------------------------------------- format
 
-def format_message(matches: list[dict], previews: list[dict]) -> str:
+def format_message(matches: list[dict], previews: list[dict], results: list[dict]) -> str:
     today = datetime.now(LISBON).strftime("%d.%m.%Y")
     preview_by_idx = {p.get("match"): p for p in previews}
 
     parts = [f"⚽️ <b>ЧМ-2026 · матчи на {today}</b>\n(время — Лиссабон, вкл. ночные игры)"]
+
+    if results:
+        lines = ["🏁 <b>Вчера сыграли:</b>"]
+        for r in results:
+            lines.append(
+                f"{esc(r['home'])} {r['home_score']}:{r['away_score']} {esc(r['away'])}"
+            )
+        parts.append("\n".join(lines))
 
     for i, m in enumerate(matches):
         p = preview_by_idx.get(i + 1, {})
@@ -267,21 +314,45 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 def main() -> None:
     tg_token = env("TELEGRAM_BOT_TOKEN")
-    tg_chat = env("TELEGRAM_CHAT_ID")
     odds_key = env("ODDS_API_KEY")
     anthropic_key = env("ANTHROPIC_API_KEY")
 
+    # Получатели = секрет TELEGRAM_CHAT_ID (ты, группы, каналы — через запятую,
+    # опционально) + все, кто подписался через /start (subscribers.json)
+    secret_chats = [
+        c.strip()
+        for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",")
+        if c.strip()
+    ]
+    try:
+        with open("subscribers.json") as f:
+            subscriber_chats = [str(c) for c in json.load(f).get("chat_ids", [])]
+    except (FileNotFoundError, json.JSONDecodeError):
+        subscriber_chats = []
+    tg_chats = list(dict.fromkeys(secret_chats + subscriber_chats))  # dedupe, порядок сохранён
+
+    if not tg_chats:
+        sys.exit("Нет ни одного получателя: задай TELEGRAM_CHAT_ID или дождись подписчиков")
+
+    results = fetch_yesterdays_results(odds_key)
     matches = fetch_todays_matches(odds_key)
     today = datetime.now(LISBON).strftime("%d.%m.%Y")
 
-    if not matches:
-        send_telegram(tg_token, tg_chat, f"⚽️ ЧМ-2026: на {today} матчей нет. Выходной 🙂")
+    if not matches and not results:
+        for chat in tg_chats:
+            send_telegram(tg_token, chat, f"⚽️ ЧМ-2026: на {today} матчей нет. Выходной 🙂")
         return
 
-    previews = ask_claude(anthropic_key, matches)
-    message = format_message(matches, previews)
-    send_telegram(tg_token, tg_chat, message)
-    print(f"Отправлено: {len(matches)} матч(ей)")
+    previews = ask_claude(anthropic_key, matches) if matches else []
+    message = format_message(matches, previews, results)
+    sent = 0
+    for chat in tg_chats:
+        try:
+            send_telegram(tg_token, chat, message)
+            sent += 1
+        except requests.HTTPError:
+            print(f"Не доставлено в {chat} (заблокировал бота или чат не найден) — пропускаю")
+    print(f"Отправлено: {len(matches)} матч(ей), {len(results)} результат(ов) → {sent}/{len(tg_chats)} чат(ов)")
 
 
 if __name__ == "__main__":
