@@ -2,9 +2,21 @@ name: WC 2026 Daily Digest
 
 on:
   schedule:
-    # 07:00 UTC = 08:00 по Лиссабону (летнее время; ЧМ заканчивается 19 июля, так что ок)
-    - cron: "12 6 * * *"
-  workflow_dispatch: {} # ручной запуск кнопкой — для теста
+    - cron: "30 5 * * *" # основной: 05:30 UTC = 06:30 Лиссабон (все западные матчи завершены)
+    - cron: "0 7 * * *"  # резерв: 07:00 UTC = 08:00 Лиссабон (если основной пропущен)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Отправить, даже если за сегодня уже слали (1 = да)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write # чтобы коммитить last_sent.json
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false
 
 jobs:
   send-digest:
@@ -24,4 +36,16 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FORCE_SEND: ${{ github.event.inputs.force }}
         run: python wc_digest.py
+
+      - name: Commit last_sent marker if changed
+        run: |
+          if [ -n "$(git status --porcelain last_sent.json)" ]; then
+            git config user.name "wc-digest-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add last_sent.json
+            git commit -m "mark digest sent"
+            git pull --rebase
+            git push
+          fi
