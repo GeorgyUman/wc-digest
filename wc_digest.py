@@ -334,6 +334,24 @@ def main() -> None:
     if not tg_chats:
         sys.exit("Нет ни одного получателя: задай TELEGRAM_CHAT_ID или дождись подписчиков")
 
+    # Защита от дублей: метка «футбольного дня», за который уже слали.
+    # Футбольный день = окно 06:00 сегодня — 06:00 завтра по Лиссабону;
+    # запуск до 06:00 относится к предыдущему дню (как и окна матчей/результатов).
+    now_lisbon = datetime.now(LISBON)
+    football_day = now_lisbon if now_lisbon.hour >= 6 else now_lisbon - timedelta(days=1)
+    day_tag = football_day.strftime("%Y-%m-%d")
+
+    force = os.environ.get("FORCE_SEND", "").strip() == "1"
+    try:
+        with open("last_sent.json") as f:
+            already_sent = json.load(f).get("day") == day_tag
+    except (FileNotFoundError, json.JSONDecodeError):
+        already_sent = False
+
+    if already_sent and not force:
+        print(f"Дайджест за {day_tag} уже отправлен — пропускаю (резервный запуск)")
+        return
+
     results = fetch_yesterdays_results(odds_key)
     matches = fetch_todays_matches(odds_key)
     today = datetime.now(LISBON).strftime("%d.%m.%Y")
@@ -341,6 +359,7 @@ def main() -> None:
     if not matches and not results:
         for chat in tg_chats:
             send_telegram(tg_token, chat, f"⚽️ ЧМ-2026: на {today} матчей нет. Выходной 🙂")
+        _mark_sent(day_tag)
         return
 
     previews = ask_claude(anthropic_key, matches) if matches else []
@@ -352,7 +371,13 @@ def main() -> None:
             sent += 1
         except requests.HTTPError:
             print(f"Не доставлено в {chat} (заблокировал бота или чат не найден) — пропускаю")
+    _mark_sent(day_tag)
     print(f"Отправлено: {len(matches)} матч(ей), {len(results)} результат(ов) → {sent}/{len(tg_chats)} чат(ов)")
+
+
+def _mark_sent(day_tag: str) -> None:
+    with open("last_sent.json", "w") as f:
+        json.dump({"day": day_tag}, f)
 
 
 if __name__ == "__main__":
